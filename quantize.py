@@ -437,6 +437,183 @@ class WeightOnlyInt4QuantHandler:
         replace_linear_int4(self.mod, self.groupsize, self.inner_k_tiles, self.padding_allowed, use_cuda)
         return self.mod
 
+
+class HqqLinearWeightOnlyInt4(torch.nn.Module):
+    def __init__(self, weight: torch.Tensor | None, scales_and_zeros: torch.Tensor | None, in_features: int, out_features: int, groupsize: int, axis: int):
+        super().__init__()
+        self.register_buffer("weight", torch.nn.UninitializedBuffer() if weight is None else weight)
+        self.register_buffer("scales_and_zeros", torch.nn.UninitializedBuffer() if scales_and_zeros is None else scales_and_zeros)
+        self.in_features = in_features
+        self.out_features = out_features
+        self.groupsize = groupsize
+        self.axis = axis
+
+    def forward(self, inp):
+        import hqq_aten
+        # TODO padding
+        # if self.axis == 1:
+        #     return linear_forward_int4(inp, self.weight, self.scales_and_zeros, self.out_features, self.groupsize)
+        # elif self.axis == 0:
+        scale = self.scales_and_zeros[0]
+        zero = self.scales_and_zeros[1]
+        shape = torch.Size([self.out_features, self.in_features])
+        if self.axis == 1 or torch._dynamo.is_compiling():
+            # TODO remove slow path here.
+            from hqq.core.quantize import Quantizer
+            w = Quantizer.unpack["4bit_u8"](self.weight, dtype=torch.bfloat16)
+            return torch.matmul(inp, ((w - zero) * scale).reshape(shape).t())
+        W = hqq_aten.dequantize(
+            self.weight,
+            scale,
+            zero,
+            shape,
+            self.groupsize,
+            4,
+            self.axis,
+            "4bit_u8",
+        )
+        return torch.matmul(inp, W.t())
+        # else:
+        #     raise AssertionError()
+
+
+class HqqLinearWeightOnlyInt4QKV(torch.nn.Module):
+    def __init__(self, q, k, v):
+        super().__init__()
+        self.q = q
+        self.k = k
+        self.v = v
+
+    def forward(self, inp):
+        return torch.cat([self.q(inp), self.k(inp), self.v(inp)], dim=-1)
+
+# TODO a hacky placeholder class
+class WeightOnlyInt4HqqQuantHandler:
+    def __init__(self, mod, groupsize, inner_k_tiles=8, axis=0):
+        self.mod = mod
+        self.groupsize = groupsize
+        self.compute_dtype = torch.bfloat16
+        self.inner_k_tiles = inner_k_tiles
+        self.device = 'cuda'
+        self.axis = axis
+
+    def _hqq_config(self):
+        import hqq.core.quantize  # TODO maybe torchao
+        config = hqq.core.quantize.hqq_base_quant_config(
+            nbits=4,
+            group_size=self.groupsize,
+            quant_zero=False,
+            quant_scale=False,
+        )
+        config['weight_quant_params']['axis'] = self.axis
+        assert config['weight_quant_params']['round_zero']
+        assert config['weight_quant_params']['optimize']
+        return config
+
+    @torch.no_grad()
+    def _hqq_quants_to_torch_quants(
+        self,
+        W_q: torch.Tensor,
+        scales: torch.Tensor,
+        zeros: torch.Tensor,
+        shape,
+        nbits=4,
+    ):
+
+        W_q    = W_q.to(dtype=self.compute_dtype, device=self.device)
+        scales = scales.to(dtype=self.compute_dtype, device=self.device)
+        zeros  = zeros.to(dtype=self.compute_dtype, device=self.device)
+
+        max_int = 2**nbits - 1
+        min_int = 0
+        dump    = 2 ** (nbits - 1)
+
+        #HQQ -> torch logic
+        new_zeros   = (scales * dump) - zeros * scales
+
+        min_val = new_zeros - scales * dump
+
+        #group_quantize_tensor_from_qparams
+        W_r  = (W_q - zeros) * scales
+
+        W_q = W_r.sub(min_val).div(scales).round().clamp_(min_int, max_int).to(torch.int32).reshape(shape).contiguous()
+
+        #group_dequantize_tensor_from_qparams
+        #W_r = W_q*scales + min_val
+
+        scales     = scales.contiguous().reshape(shape[0], -1)
+        new_zeros  = new_zeros.contiguous().reshape(shape[0], -1)
+
+        return W_q, scales, new_zeros
+
+    def _convert_linear(self, child):
+        from hqq.core.quantize import HQQLinear, Quantizer # TODO maybe torchao
+        hqq = HQQLinear(
+            child,
+            self._hqq_config(),
+            compute_dtype=torch.bfloat16,
+        )
+        meta = hqq.meta
+        axis = meta['axis']
+        scales = meta['scale']
+        zeros = meta['zero']
+        # if axis == 1:
+        #     W_q = Quantizer.unpack[meta['packing']](hqq.W_q)
+        #     W_q_torch, scales_torch, zeros_torch = self._hqq_quants_to_torch_quants(W_q, scales, zeros, shape=meta['shape'])
+        #     weight = torch.ops.aten._convert_weight_to_int4pack(W_q_torch, self.inner_k_tiles)
+        #     scales_and_zeros = pack_scales_and_zeros(scales_torch, zeros_torch)
+        # elif axis == 0:
+        weight = hqq.W_q
+        scales_and_zeros = torch.stack([scales, zeros])
+        # else:
+        #     raise AssertionError()
+        assert meta['shape'][0] == child.out_features
+        assert meta['shape'][1] == child.in_features
+        return HqqLinearWeightOnlyInt4(weight, scales_and_zeros, child.in_features, child.out_features, self.groupsize, axis=axis)
+
+    def _create_quantized_state_dict(self):
+        for m in self.mod.modules():
+            for name, child in m.named_children():
+                if isinstance(child, torch.nn.Linear):
+                    if name == "wqkv":
+                        in_features = child.weight.shape[1]
+                        assert child.weight.shape[0] % 3 == 0
+                        out_features = child.weight.shape[0] // 3
+                        q_layer = torch.nn.Linear(in_features, out_features, bias=False)
+                        q_layer.weight = torch.nn.Parameter(child.weight[:out_features,:])
+                        q_layer = self._convert_linear(q_layer)
+                        k_layer = torch.nn.Linear(in_features, out_features, bias=False)
+                        k_layer.weight = torch.nn.Parameter(child.weight[out_features:2*out_features,:])
+                        k_layer = self._convert_linear(k_layer)
+                        v_layer = torch.nn.Linear(in_features, out_features, bias=False)
+                        v_layer.weight = torch.nn.Parameter(child.weight[2*out_features:,:])
+                        v_layer = self._convert_linear(v_layer)
+
+                        setattr(m, name, HqqLinearWeightOnlyInt4QKV(q_layer, k_layer, v_layer))
+                    else:
+                        setattr(m, name, self._convert_linear(child))
+
+        return self.mod.state_dict()
+
+    def _convert_for_runtime(self):
+        axis = self._hqq_config()['weight_quant_params']['axis']
+        for m in self.mod.modules():
+            for name, child in m.named_children():
+                if isinstance(child, torch.nn.Linear):
+                    if name == "wqkv":
+                        in_features = child.weight.shape[1]
+                        assert child.weight.shape[0] % 3 == 0
+                        out_features = child.weight.shape[0] // 3
+                        q_layer = HqqLinearWeightOnlyInt4(None, None, in_features, out_features, self.groupsize, axis=axis)
+                        k_layer = HqqLinearWeightOnlyInt4(None, None, in_features, out_features, self.groupsize, axis=axis)
+                        v_layer = HqqLinearWeightOnlyInt4(None, None, in_features, out_features, self.groupsize, axis=axis)
+                        setattr(m, name, HqqLinearWeightOnlyInt4QKV(q_layer, k_layer, v_layer))
+                    else:
+                        setattr(m, name, HqqLinearWeightOnlyInt4(None, None, child.in_features, child.out_features, self.groupsize, axis=axis))
+
+        return self.mod
+
+
 class WeightOnlyInt4GPTQQuantHandler(GPTQQuantHandler):
     def __init__(self, mod, groupsize=128, inner_k_tiles=8, padding=True):
         from model import find_multiple
@@ -595,6 +772,19 @@ def quantize(
         dir_name = checkpoint_path.parent
         base_name = checkpoint_path.name
         new_base_name = base_name.replace('.pth', f"{label}int4-gptq.g{groupsize}.{device}.pth")
+    elif mode == 'int4-hqq':
+        print("Quantizing model weights for int4 using HQQ")
+        quant_handler = WeightOnlyInt4HqqQuantHandler(model, groupsize)
+        axis = quant_handler.axis
+        tokenizer_path = checkpoint_path.parent / "tokenizer.model"
+        assert tokenizer_path.is_file(), tokenizer_path
+        tokenizer = SentencePieceProcessor(model_file=str(tokenizer_path))
+
+        quantized_state_dict = quant_handler._create_quantized_state_dict()
+        dir_name = checkpoint_path.parent
+        base_name = checkpoint_path.name
+        new_base_name = base_name.replace('.pth', f"{label}int4-hqq.g{groupsize}.{device}.axis{axis}.pth")
+
     else:
         raise ValueError(f"Invalid quantization mode {mode} needs to be one of [int8, int4, int4-gpptq]")
 
@@ -609,7 +799,7 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Quantize a model.')
     parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"), help='Path to the model checkpoint to be quantized.')
-    parser.add_argument('--mode', '-q', type=str, default='int8', choices=['int8', 'int4', 'int4-gptq'], help='type of quantization to perform')
+    parser.add_argument('--mode', '-q', type=str, default='int8', choices=['int8', 'int4', 'int4-gptq', 'int4-hqq'], help='type of quantization to perform')
     parser.add_argument('--groupsize', type=int, default=32, help='Group size for int4 quantization.')
     parser.add_argument('--calibration_tasks', type=str, nargs='+', default=['wikitext'], help='tasks to do gptq calibration on, if doing gptq')
     parser.add_argument('--calibration_limit', type=int, default=1000, help='number of samples to use for gptq calibration')
